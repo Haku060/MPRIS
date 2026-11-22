@@ -972,6 +972,16 @@ def version_tokens(text):
     return tokens
 
 
+CROSS_SCRIPT_MATCH_SCORE = 100  # Below the minimum ordinary match score.
+
+
+def artist_scripts(name):
+    return {
+        unicodedata.name(char, "").split(" ", 1)[0]
+        for char in name if char.isalpha()
+    } - {""}
+
+
 def score_text_match(
     query_title,
     query_artist,
@@ -1011,8 +1021,8 @@ def score_text_match(
         return 0
 
     artist_score = 0
+    candidate_artists = [normalize(name) for name in candidate_artists]
     for name in candidate_artists:
-        name = normalize(name)
         if not name or not query_artist:
             continue
         if name == query_artist:
@@ -1032,9 +1042,22 @@ def score_text_match(
         else:
             duration_score = -60
 
-    # Require an artist match; this rejects same-title covers.
     if query_artist:
         if artist_score < 60:
+            if (
+                title_score == 100
+                and (query_length_ms or 0) > 0
+                and (candidate_duration_ms or 0) > 0
+                and abs(candidate_duration_ms - query_length_ms) <= 1000
+            ):
+                query_scripts = artist_scripts(query_artist)
+                candidate_scripts = artist_scripts(" ".join(candidate_artists))
+                if (
+                    query_scripts
+                    and candidate_scripts
+                    and query_scripts.isdisjoint(candidate_scripts)
+                ):
+                    return CROSS_SCRIPT_MATCH_SCORE
             return 0
     else:
         # Without artist metadata, only an exact title plus a close
@@ -1053,7 +1076,7 @@ def score_text_match(
     return score
 
 
-def netease_pick_song(songs, artist, title, length_ms):
+def netease_pick_song(songs, artist, title, length_ms, cross_script_artists):
     query_title = normalize(title)
     query_artist = normalize(artist)
     best = None
@@ -1069,6 +1092,8 @@ def netease_pick_song(songs, artist, title, length_ms):
             length_ms,
             title,
         )
+        if score == CROSS_SCRIPT_MATCH_SCORE:
+            cross_script_artists.add(normalize(" ".join(netease_song_artists(song))))
         if score > best_score:
             best = song
             best_score = score
@@ -1097,32 +1122,29 @@ def netease_lyrics(song_id):
     return lrc, yrc
 
 
-def fetch_netease_candidate(artist, title, length_ms):
-    query = f"{artist} {title}".strip()
+def fetch_netease_candidate(artist, title, length_ms, cross_script_artists):
+    query = search_text(f"{artist} {title}".strip())
     if not query:
         return None
 
     try:
-        search_query = search_text(query)
-        songs = netease_search(search_query, limit=50, offset=0)
-        if not songs and artist:
-            search_query = search_text(title)
-            songs = netease_search(search_query, limit=50, offset=0)
-        if not songs:
-            log(f"NetEase: no search results for {query!r}")
-            return None
-
-        song, score = netease_pick_song(songs, artist, title, length_ms)
-        if not song:
-            # The exact track is sometimes buried under many covers.
-            more = netease_search(search_query, limit=50, offset=50)
-            if more:
-                songs += more
-                song, score = netease_pick_song(
-                    songs, artist, title, length_ms
+        song, score = None, 0
+        for search_query in dict.fromkeys((query, search_text(title))):
+            for offset in (0, 50):
+                songs = netease_search(search_query, limit=50, offset=offset)
+                best, best_score = netease_pick_song(
+                    songs, artist, title, length_ms, cross_script_artists
                 )
+                if best_score > score:
+                    song, score = best, best_score
+                if score > CROSS_SCRIPT_MATCH_SCORE or len(songs) < 50:
+                    break
+            if score > CROSS_SCRIPT_MATCH_SCORE:
+                break
         if not song:
             log(f"NetEase: no suitable match for {query!r}")
+            return None
+        if score == CROSS_SCRIPT_MATCH_SCORE and len(cross_script_artists) > 1:
             return None
 
         lrc, yrc = netease_lyrics(song["id"])
@@ -1177,16 +1199,33 @@ def score_lrclib_track(track, artist, title, length_ms):
     )
 
 
-def add_lrclib_candidate(candidates, track, artist, title, length_ms):
+def add_lrclib_candidate(
+    candidates, track, artist, title, length_ms, cross_script_artists
+):
     score = score_lrclib_track(track, artist, title, length_ms)
     if not score:
         return
+    if score == CROSS_SCRIPT_MATCH_SCORE:
+        cross_script_artists.add(normalize(track.get("artistName", "")))
     lines = parse_lrclib_track(track)
     if len(lines) >= 2:
         candidates.append((score, track, lines))
 
 
-def fetch_lrclib_candidate(artist, title, length_ms):
+def search_lrclib(query):
+    url = "https://lrclib.net/api/search?" + urllib.parse.urlencode({"q": query})
+    for attempt in range(2):
+        try:
+            return http_json(url) or []
+        except Exception as e:
+            if attempt == 0:
+                time.sleep(0.5)
+            else:
+                log(f"LRCLIB search error: {type(e).__name__}: {e}")
+    return []
+
+
+def fetch_lrclib_candidate(artist, title, length_ms, cross_script_artists):
     if not title:
         return None
 
@@ -1201,7 +1240,9 @@ def fetch_lrclib_candidate(artist, title, length_ms):
             {"artist_name": artist_query, "track_name": title_query}
         )
         data = http_json(f"https://lrclib.net/api/get?{params}")
-        add_lrclib_candidate(candidates, data, artist, title, length_ms)
+        add_lrclib_candidate(
+            candidates, data, artist, title, length_ms, cross_script_artists
+        )
     except urllib.error.HTTPError as e:
         if e.code != 404:
             log(f"LRCLIB get error: HTTP {e.code}")
@@ -1209,28 +1250,20 @@ def fetch_lrclib_candidate(artist, title, length_ms):
         log(f"LRCLIB get error: {type(e).__name__}: {e}")
 
     query = f"{artist_query} {title_query}".strip()
-    search_url = (
-        "https://lrclib.net/api/search?"
-        + urllib.parse.urlencode({"q": query})
-    )
-    for attempt in range(2):
-        try:
-            results = http_json(search_url)
-            for track in results or []:
-                add_lrclib_candidate(
-                    candidates, track, artist, title, length_ms
-                )
+    for search_query in dict.fromkeys((query, title_query)):
+        for track in search_lrclib(search_query):
+            add_lrclib_candidate(
+                candidates, track, artist, title, length_ms, cross_script_artists
+            )
+        if any(score > CROSS_SCRIPT_MATCH_SCORE for score, _, _ in candidates):
             break
-        except Exception as e:
-            if attempt == 0:
-                time.sleep(0.5)
-                continue
-            log(f"LRCLIB search error: {type(e).__name__}: {e}")
 
     if not candidates:
         return None
 
     score, track, lines = max(candidates, key=lambda item: item[0])
+    if score == CROSS_SCRIPT_MATCH_SCORE and len(cross_script_artists) > 1:
+        return None
     detail = f"{track.get('trackName')} - {track.get('artistName')}"
     return build_candidate("lrclib", lines, score, detail, length_ms)
 
@@ -1240,15 +1273,20 @@ def fetch_lyrics(artist, title, length_ms, local_index):
         return []
 
     candidates = []
+    cross_script_artists = set()
     for source in LYRICS_SOURCES:
         if source == "local":
             candidate = find_local_candidate(
                 artist, title, local_index, length_ms
             )
         elif source == "netease":
-            candidate = fetch_netease_candidate(artist, title, length_ms)
+            candidate = fetch_netease_candidate(
+                artist, title, length_ms, cross_script_artists
+            )
         elif source == "lrclib":
-            candidate = fetch_lrclib_candidate(artist, title, length_ms)
+            candidate = fetch_lrclib_candidate(
+                artist, title, length_ms, cross_script_artists
+            )
         else:
             continue
 
@@ -1261,6 +1299,16 @@ def fetch_lyrics(artist, title, length_ms, local_index):
             )
         else:
             log(f"Scoreboard: {source} -> no candidate")
+
+    standard_matches = [
+        candidate for candidate in candidates
+        if candidate["match"] != CROSS_SCRIPT_MATCH_SCORE
+    ]
+    if standard_matches:
+        candidates = standard_matches
+    elif len(cross_script_artists) > 1:
+        log("Scoreboard: ambiguous match across artist names")
+        return []
 
     if not candidates:
         log("Scoreboard: no acceptable lyrics")
