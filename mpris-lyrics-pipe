@@ -846,9 +846,23 @@ def netease_search(query, limit=50, offset=0):
     return ((result.get("result") or {}).get("songs") or [])
 
 
-def netease_song_artists(song):
+def netease_names(record, alternate_keys):
+    names = [record.get("name", "")]
+    for key in alternate_keys:
+        value = record.get(key)
+        if isinstance(value, list):
+            names.extend(str(item) for item in value if item)
+        elif isinstance(value, str) and value:
+            names.append(value)
+    return [name for name in names if name]
+
+
+def netease_song_artists(song, include_aliases=False):
     artists = song.get("artists") or song.get("ar") or []
-    return [a.get("name", "") for a in artists if a.get("name")]
+    alternate_keys = ("tns", "alias") if include_aliases else ()
+    return [
+        name for artist in artists for name in netease_names(artist, alternate_keys)
+    ]
 
 
 def netease_song_duration(song):
@@ -958,17 +972,6 @@ def version_tokens(text):
     return tokens
 
 
-def netease_song_titles(song):
-    titles = [song.get("name", "")]
-    for key in ("alia", "tns", "alias"):
-        value = song.get(key)
-        if isinstance(value, list):
-            titles.extend(str(item) for item in value if item)
-        elif isinstance(value, str) and value:
-            titles.append(value)
-    return [item for item in titles if item]
-
-
 def score_text_match(
     query_title,
     query_artist,
@@ -1060,8 +1063,8 @@ def netease_pick_song(songs, artist, title, length_ms):
         score = score_text_match(
             query_title,
             query_artist,
-            netease_song_titles(song),
-            netease_song_artists(song),
+            netease_names(song, ("alia", "tns", "alias")),
+            netease_song_artists(song, include_aliases=True),
             netease_song_duration(song),
             length_ms,
             title,
