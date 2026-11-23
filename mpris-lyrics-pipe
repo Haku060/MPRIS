@@ -1004,6 +1004,10 @@ def titles_within_one_edit(query, candidate):
     )
 
 
+def matches_album(album, candidate_albums):
+    return bool(album) and any(normalize(name) == album for name in candidate_albums)
+
+
 def record_fallback_match(matches, score, title, artist, album, candidate_albums):
     if score == FUZZY_TITLE_MATCH_SCORE:
         identity = normalize(title).replace(" ", "")
@@ -1012,7 +1016,7 @@ def record_fallback_match(matches, score, title, artist, album, candidate_albums
     else:
         return False
 
-    same_album = bool(album) and any(normalize(name) == album for name in candidate_albums)
+    same_album = matches_album(album, candidate_albums)
     matches.setdefault((score, same_album), set()).add(identity)
     return same_album
 
@@ -1121,11 +1125,10 @@ def score_text_match(
     return score
 
 
-def netease_pick_song(songs, artist, title, length_ms, album, fallback_matches):
+def rank_netease_songs(songs, artist, title, length_ms, album, fallback_matches):
     query_title = normalize(title)
     query_artist = normalize(artist)
-    best = None
-    best_priority = (0, False)
+    ranked = []
 
     for song in songs:
         score = score_text_match(
@@ -1137,19 +1140,25 @@ def netease_pick_song(songs, artist, title, length_ms, album, fallback_matches):
             length_ms,
             title,
         )
-        same_album = False
-        if score in (FUZZY_TITLE_MATCH_SCORE, CROSS_SCRIPT_MATCH_SCORE):
-            same_album = record_fallback_match(
-                fallback_matches, score, song.get("name"),
-                " ".join(netease_song_artists(song)), album,
-                netease_names(song.get("al") or song.get("album") or {}, ("tns", "alias")),
-            )
-        priority = (score, same_album)
-        if priority > best_priority:
-            best = song
-            best_priority = priority
+        if not score:
+            continue
 
-    return best, best_priority
+        song_album = song.get("al") or song.get("album") or {}
+        album_names = netease_names(song_album, ("tns", "alias"))
+        if score <= FUZZY_TITLE_MATCH_SCORE:
+            same_album = record_fallback_match(
+                fallback_matches,
+                score,
+                song.get("name"),
+                " ".join(netease_song_artists(song)),
+                album,
+                album_names,
+            )
+        else:
+            same_album = matches_album(album, album_names)
+        ranked.append(((score, same_album), song))
+
+    return ranked
 
 
 def netease_lyrics(song_id):
@@ -1179,39 +1188,64 @@ def fetch_netease_candidate(artist, title, length_ms, album, fallback_matches):
         return None
 
     try:
-        song, priority = None, (0, False)
+        ranked = []
         for search_query in dict.fromkeys((query, search_text(title))):
             for offset in (0, 50):
                 songs = netease_search(search_query, limit=50, offset=offset)
-                best, best_priority = netease_pick_song(
+                matches = rank_netease_songs(
                     songs, artist, title, length_ms, album, fallback_matches
                 )
-                if best_priority > priority:
-                    song, priority = best, best_priority
-                if priority[0] > FUZZY_TITLE_MATCH_SCORE or len(songs) < 50:
+                ranked.extend(matches)
+                found_standard = any(
+                    score > FUZZY_TITLE_MATCH_SCORE for (score, _), _ in matches
+                )
+                if found_standard or len(songs) < 50:
                     break
-            if priority[0] > FUZZY_TITLE_MATCH_SCORE:
+            if found_standard:
                 break
-        if not song:
+        if not ranked:
             log(f"NetEase: no suitable match for {query!r}")
             return None
-        if len(fallback_matches.get(priority, ())) > 1:
-            return None
-        score, same_album = priority
 
-        lrc, yrc = netease_lyrics(song["id"])
-        lines = parse_lyrics(lrc)
-        if len(lines) < 2:
-            lines = parse_yrc(yrc)
-        if len(lines) < 2:
-            log(f"NetEase: no synced lyrics for {song.get('name')!r}")
+        ranked.sort(key=lambda item: item[0], reverse=True)
+        best_priority = ranked[0][0]
+        best_score, _ = best_priority
+        if len(fallback_matches.get(best_priority, ())) > 1:
             return None
 
-        names = " / ".join(netease_song_artists(song))
-        detail = f"{song.get('name')} - {names}"
-        return build_candidate(
-            "netease", lines, score, detail, length_ms, same_album=same_album
+        # Album agreement breaks ties for ordinary matches. Fallbacks must
+        # keep their album evidence as it is part of the ambiguity check.
+        minimum_priority = (
+            best_priority if best_score <= FUZZY_TITLE_MATCH_SCORE else (best_score, False)
         )
+        seen_ids = set()
+        for priority, song in ranked:
+            if priority < minimum_priority:
+                break
+            song_id = song.get("id")
+            if song_id is None or song_id in seen_ids:
+                continue
+            seen_ids.add(song_id)
+            try:
+                lrc, yrc = netease_lyrics(song_id)
+            except (OSError, ValueError) as e:
+                log(f"NetEase lyrics error for {song_id}: {type(e).__name__}: {e}")
+                continue
+
+            lines = parse_lyrics(lrc)
+            if len(lines) < 2:
+                lines = parse_yrc(yrc)
+            score, same_album = priority
+            names = " / ".join(netease_song_artists(song))
+            detail = f"{song.get('name')} - {names}"
+            candidate = build_candidate(
+                "netease", lines, score, detail, length_ms, same_album=same_album
+            )
+            if candidate:
+                return candidate
+
+        log(f"NetEase: no usable synced lyrics for {query!r}")
+        return None
     except Exception as e:
         log(f"NetEase error: {type(e).__name__}: {e}")
         return None
