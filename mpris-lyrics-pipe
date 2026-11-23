@@ -458,6 +458,7 @@ def get_player_state(bus_name):
         "label": "",
         "title": "",
         "artist": "",
+        "album": "",
         "position_ms": None,
         "length_ms": None,
     }
@@ -468,6 +469,7 @@ def get_player_state(bus_name):
     status = status_match.group(1) if status_match else None
 
     title_match = re.search(r"'xesam:title': <" + GV_STRING + ">", out)
+    album_match = re.search(r"'xesam:album': <" + GV_STRING + ">", out)
     artist_match = re.search(r"'xesam:artist': <\[(.*?)\]>", out, re.S)
     length_match = re.search(
         r"'mpris:length': <u?int64 (-?\d+)>", out
@@ -478,6 +480,7 @@ def get_player_state(bus_name):
     position_match = re.search(r"'Position': <u?int64 (-?\d+)>", out)
 
     title = gv_first_match(title_match) if title_match else ""
+    album = gv_first_match(album_match) if album_match else ""
     artist = ""
     if artist_match:
         artist = " ".join(
@@ -496,6 +499,8 @@ def get_player_state(bus_name):
     position_us = int(position_match.group(1)) if position_match else None
 
     key_parts = (artist, title, str(length_us), trackid)
+    if album:
+        key_parts += (album,)
     if any(key_parts):
         track_key = hashlib.md5(
             "\x1f".join(key_parts).encode("utf-8", "replace")
@@ -510,6 +515,7 @@ def get_player_state(bus_name):
         "label": label,
         "title": title,
         "artist": artist,
+        "album": album,
         "position_ms": None if position_us is None else max(0, position_us // 1000),
         "length_ms": max(0, length_us // 1000) if length_us else None,
     }
@@ -711,7 +717,7 @@ def lyric_quality_score(lines, length_ms):
     return line_score + coverage + density_score
 
 
-def build_candidate(source, lines, match_score, detail, length_ms):
+def build_candidate(source, lines, match_score, detail, length_ms, *, same_album=False):
     quality = lyric_quality_score(lines, length_ms)
     if quality < 30:
         return None
@@ -722,6 +728,7 @@ def build_candidate(source, lines, match_score, detail, length_ms):
         "quality": quality,
         "total": match_score + quality + SOURCE_BONUS.get(source, 0),
         "detail": detail,
+        "same_album": same_album,
     }
 
 
@@ -972,7 +979,42 @@ def version_tokens(text):
     return tokens
 
 
-CROSS_SCRIPT_MATCH_SCORE = 100  # Below the minimum ordinary match score.
+# Both fallback scores are below the minimum ordinary match score.
+CROSS_SCRIPT_MATCH_SCORE = 100
+FUZZY_TITLE_MATCH_SCORE = 110
+
+
+def titles_within_one_edit(query, candidate):
+    """Compare normalized titles without spaces, allowing one edit or swap."""
+    shorter, longer = sorted((query.replace(" ", ""), candidate.replace(" ", "")), key=len)
+    if len(shorter) < 6 or len(longer) - len(shorter) > 1:
+        return False
+
+    for index, (left, right) in enumerate(zip(shorter, longer)):
+        if left != right:
+            break
+    else:
+        return True
+
+    if len(shorter) < len(longer):
+        return shorter[index:] == longer[index + 1:]
+    return shorter[index + 1:] == longer[index + 1:] or (
+        shorter[index:index + 2] == longer[index:index + 2][::-1]
+        and shorter[index + 2:] == longer[index + 2:]
+    )
+
+
+def record_fallback_match(matches, score, title, artist, album, candidate_albums):
+    if score == FUZZY_TITLE_MATCH_SCORE:
+        identity = normalize(title).replace(" ", "")
+    elif score == CROSS_SCRIPT_MATCH_SCORE:
+        identity = normalize(artist)
+    else:
+        return False
+
+    same_album = bool(album) and any(normalize(name) == album for name in candidate_albums)
+    matches.setdefault((score, same_album), set()).add(identity)
+    return same_album
 
 
 def artist_scripts(name):
@@ -1002,9 +1044,9 @@ def score_text_match(
     if version_tokens(primary_title) != version_tokens(raw_query_title):
         return 0
 
+    candidate_titles = [normalize(candidate) for candidate in candidate_titles]
     title_score = 0
-    for candidate in candidate_titles:
-        candidate_title = normalize(candidate)
+    for candidate_title in candidate_titles:
         if not candidate_title:
             continue
         if candidate_title == query_title:
@@ -1014,11 +1056,6 @@ def score_text_match(
             or candidate_title in query_title
         ):
             title_score = max(title_score, 60)
-
-    # A different title must not be accepted just because the artist and
-    # duration are similar.
-    if title_score == 0:
-        return 0
 
     artist_score = 0
     candidate_artists = [normalize(name) for name in candidate_artists]
@@ -1042,14 +1079,22 @@ def score_text_match(
         else:
             duration_score = -60
 
+    close_duration = (
+        (query_length_ms or 0) > 0
+        and (candidate_duration_ms or 0) > 0
+        and abs(candidate_duration_ms - query_length_ms) <= 1000
+    )
+    if title_score == 0:
+        if artist_score == 100 and close_duration and any(
+            titles_within_one_edit(query_title, candidate)
+            for candidate in candidate_titles
+        ):
+            return FUZZY_TITLE_MATCH_SCORE
+        return 0
+
     if query_artist:
         if artist_score < 60:
-            if (
-                title_score == 100
-                and (query_length_ms or 0) > 0
-                and (candidate_duration_ms or 0) > 0
-                and abs(candidate_duration_ms - query_length_ms) <= 1000
-            ):
+            if title_score == 100 and close_duration:
                 query_scripts = artist_scripts(query_artist)
                 candidate_scripts = artist_scripts(" ".join(candidate_artists))
                 if (
@@ -1076,11 +1121,11 @@ def score_text_match(
     return score
 
 
-def netease_pick_song(songs, artist, title, length_ms, cross_script_artists):
+def netease_pick_song(songs, artist, title, length_ms, album, fallback_matches):
     query_title = normalize(title)
     query_artist = normalize(artist)
     best = None
-    best_score = 0
+    best_priority = (0, False)
 
     for song in songs:
         score = score_text_match(
@@ -1092,13 +1137,19 @@ def netease_pick_song(songs, artist, title, length_ms, cross_script_artists):
             length_ms,
             title,
         )
-        if score == CROSS_SCRIPT_MATCH_SCORE:
-            cross_script_artists.add(normalize(" ".join(netease_song_artists(song))))
-        if score > best_score:
+        same_album = False
+        if score in (FUZZY_TITLE_MATCH_SCORE, CROSS_SCRIPT_MATCH_SCORE):
+            same_album = record_fallback_match(
+                fallback_matches, score, song.get("name"),
+                " ".join(netease_song_artists(song)), album,
+                netease_names(song.get("al") or song.get("album") or {}, ("tns", "alias")),
+            )
+        priority = (score, same_album)
+        if priority > best_priority:
             best = song
-            best_score = score
+            best_priority = priority
 
-    return best, best_score
+    return best, best_priority
 
 
 def netease_lyrics(song_id):
@@ -1122,30 +1173,31 @@ def netease_lyrics(song_id):
     return lrc, yrc
 
 
-def fetch_netease_candidate(artist, title, length_ms, cross_script_artists):
+def fetch_netease_candidate(artist, title, length_ms, album, fallback_matches):
     query = search_text(f"{artist} {title}".strip())
     if not query:
         return None
 
     try:
-        song, score = None, 0
+        song, priority = None, (0, False)
         for search_query in dict.fromkeys((query, search_text(title))):
             for offset in (0, 50):
                 songs = netease_search(search_query, limit=50, offset=offset)
-                best, best_score = netease_pick_song(
-                    songs, artist, title, length_ms, cross_script_artists
+                best, best_priority = netease_pick_song(
+                    songs, artist, title, length_ms, album, fallback_matches
                 )
-                if best_score > score:
-                    song, score = best, best_score
-                if score > CROSS_SCRIPT_MATCH_SCORE or len(songs) < 50:
+                if best_priority > priority:
+                    song, priority = best, best_priority
+                if priority[0] > FUZZY_TITLE_MATCH_SCORE or len(songs) < 50:
                     break
-            if score > CROSS_SCRIPT_MATCH_SCORE:
+            if priority[0] > FUZZY_TITLE_MATCH_SCORE:
                 break
         if not song:
             log(f"NetEase: no suitable match for {query!r}")
             return None
-        if score == CROSS_SCRIPT_MATCH_SCORE and len(cross_script_artists) > 1:
+        if len(fallback_matches.get(priority, ())) > 1:
             return None
+        score, same_album = priority
 
         lrc, yrc = netease_lyrics(song["id"])
         lines = parse_lyrics(lrc)
@@ -1157,7 +1209,9 @@ def fetch_netease_candidate(artist, title, length_ms, cross_script_artists):
 
         names = " / ".join(netease_song_artists(song))
         detail = f"{song.get('name')} - {names}"
-        return build_candidate("netease", lines, score, detail, length_ms)
+        return build_candidate(
+            "netease", lines, score, detail, length_ms, same_album=same_album
+        )
     except Exception as e:
         log(f"NetEase error: {type(e).__name__}: {e}")
         return None
@@ -1200,16 +1254,18 @@ def score_lrclib_track(track, artist, title, length_ms):
 
 
 def add_lrclib_candidate(
-    candidates, track, artist, title, length_ms, cross_script_artists
+    candidates, track, artist, title, length_ms, album, fallback_matches
 ):
     score = score_lrclib_track(track, artist, title, length_ms)
     if not score:
         return
-    if score == CROSS_SCRIPT_MATCH_SCORE:
-        cross_script_artists.add(normalize(track.get("artistName", "")))
+    same_album = record_fallback_match(
+        fallback_matches, score, track.get("trackName"), track.get("artistName"),
+        album, [track.get("albumName")],
+    )
     lines = parse_lrclib_track(track)
     if len(lines) >= 2:
-        candidates.append((score, track, lines))
+        candidates.append(((score, same_album), track, lines))
 
 
 def search_lrclib(query):
@@ -1225,7 +1281,7 @@ def search_lrclib(query):
     return []
 
 
-def fetch_lrclib_candidate(artist, title, length_ms, cross_script_artists):
+def fetch_lrclib_candidate(artist, title, length_ms, album, fallback_matches):
     if not title:
         return None
 
@@ -1241,7 +1297,7 @@ def fetch_lrclib_candidate(artist, title, length_ms, cross_script_artists):
         )
         data = http_json(f"https://lrclib.net/api/get?{params}")
         add_lrclib_candidate(
-            candidates, data, artist, title, length_ms, cross_script_artists
+            candidates, data, artist, title, length_ms, album, fallback_matches
         )
     except urllib.error.HTTPError as e:
         if e.code != 404:
@@ -1253,27 +1309,28 @@ def fetch_lrclib_candidate(artist, title, length_ms, cross_script_artists):
     for search_query in dict.fromkeys((query, title_query)):
         for track in search_lrclib(search_query):
             add_lrclib_candidate(
-                candidates, track, artist, title, length_ms, cross_script_artists
+                candidates, track, artist, title, length_ms, album, fallback_matches
             )
-        if any(score > CROSS_SCRIPT_MATCH_SCORE for score, _, _ in candidates):
+        if any(priority[0] > FUZZY_TITLE_MATCH_SCORE for priority, _, _ in candidates):
             break
 
     if not candidates:
         return None
 
-    score, track, lines = max(candidates, key=lambda item: item[0])
-    if score == CROSS_SCRIPT_MATCH_SCORE and len(cross_script_artists) > 1:
-        return None
+    (score, same_album), track, lines = max(candidates, key=lambda item: item[0])
     detail = f"{track.get('trackName')} - {track.get('artistName')}"
-    return build_candidate("lrclib", lines, score, detail, length_ms)
+    return build_candidate(
+        "lrclib", lines, score, detail, length_ms, same_album=same_album
+    )
 
 
-def fetch_lyrics(artist, title, length_ms, local_index):
+def fetch_lyrics(artist, title, length_ms, local_index, album=""):
     if not title:
         return []
 
     candidates = []
-    cross_script_artists = set()
+    fallback_matches = {}
+    album = normalize(album)
     for source in LYRICS_SOURCES:
         if source == "local":
             candidate = find_local_candidate(
@@ -1281,11 +1338,11 @@ def fetch_lyrics(artist, title, length_ms, local_index):
             )
         elif source == "netease":
             candidate = fetch_netease_candidate(
-                artist, title, length_ms, cross_script_artists
+                artist, title, length_ms, album, fallback_matches
             )
         elif source == "lrclib":
             candidate = fetch_lrclib_candidate(
-                artist, title, length_ms, cross_script_artists
+                artist, title, length_ms, album, fallback_matches
             )
         else:
             continue
@@ -1302,13 +1359,19 @@ def fetch_lyrics(artist, title, length_ms, local_index):
 
     standard_matches = [
         candidate for candidate in candidates
-        if candidate["match"] != CROSS_SCRIPT_MATCH_SCORE
+        if candidate["match"] > FUZZY_TITLE_MATCH_SCORE
     ]
     if standard_matches:
         candidates = standard_matches
-    elif len(cross_script_artists) > 1:
-        log("Scoreboard: ambiguous match across artist names")
-        return []
+    elif fallback_matches:
+        priority = max(fallback_matches)
+        if len(fallback_matches[priority]) > 1:
+            log("Scoreboard: ambiguous fallback match")
+            return []
+        candidates = [
+            candidate for candidate in candidates
+            if (candidate["match"], candidate["same_album"]) == priority
+        ]
 
     if not candidates:
         log("Scoreboard: no acceptable lyrics")
@@ -1492,6 +1555,7 @@ def main():
                                 state.get("title", ""),
                                 state.get("length_ms"),
                                 local_index,
+                                album=state.get("album", ""),
                             )
                             line_times = [item[0] for item in lines]
                             if lines:
